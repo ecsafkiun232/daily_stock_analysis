@@ -1,0 +1,27 @@
+name: 股票分析-第2组
+
+on:
+  schedule:
+    - cron: '5 10 * * 1-5'  # 北京时间18:05
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -r requirements.txt
+      - run: mkdir -p reports
+
+      - name: 分析第2组
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          SERVERCHAN3_SENDKEY: ${{ secrets.SERVERCHAN3_SENDKEY }}
+          WECHAT_WEBHOOK_URL: ${{ secrets.WECHAT_WEBHOOK_URL }}
+          STOCK_LIST: "601211,601066,600999,000166,601377,601555,601788,600958,601099,600109,600369,600909,601901,601198,601375,601990,601162,601108,601456,601236,601696,600887,600597,600872,600809,600600,000568,000799,000869,000895,600132,600197,600199"
+          REPORT_TYPE: simple
+        run: python main.py

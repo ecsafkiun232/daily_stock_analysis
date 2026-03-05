@@ -1,8 +1,9 @@
 name: 股票分析-第4组
 
 on:
+  # 定时触发：北京时间18:15（UTC 10:15）
   schedule:
-    - cron: '15 10 * * 1-5' # 北京时间18:15
+    - cron: '15 10 * * 1-5'
   workflow_dispatch:
 
 jobs:
@@ -14,14 +15,26 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - run: pip install -r requirements.txt
-      - run: mkdir -p reports
-
-      - name: 分析第4组
+          cache: 'pip'
+      - run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+      - run: mkdir -p reports logs
+      - name: 分析第4组个股
         env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          AIHUBMIX_KEY: ${{ secrets.AIHUBMIX_KEY }}
+          AI_REQUEST_DELAY: '5.0'
           SERVERCHAN3_SENDKEY: ${{ secrets.SERVERCHAN3_SENDKEY }}
           WECHAT_WEBHOOK_URL: ${{ secrets.WECHAT_WEBHOOK_URL }}
-          STOCK_LIST: "600660,600674,600690,600703,600705,600741,600745,600760,600763,600776,600795,600900,600919,600926,601006,601018,601088,601100,601111,601117,601138,601155,601169,601186,601216,601225,601229,601336,601360,601390,601601,601607"
+          STOCK_LIST: "300204,600111,002549,000831,300085,002459,688256,300718,300394,601398,688981,300033,300059,002241,600418,600900,688648,603019,000737,300502,601899,002085,002738,002709,601888,601138,300308,000977,300418,601012,300750,601088,601127,600519,002466"
           REPORT_TYPE: simple
         run: python main.py
+      - name: 上传第4组分析报告
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: 第4组分析报告-${{ github.run_number }}
+          path: |
+            reports/
+            logs/
+          retention-days: 7

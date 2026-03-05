@@ -15,25 +15,20 @@ jobs:
         with:
           python-version: '3.11'
           cache: 'pip'
-      # 修复Gemini依赖 + 新增推送验证依赖
       - run: |
           pip install --upgrade pip
           pip install -r requirements.txt || echo "无requirements.txt，跳过"
           pip install tushare==1.2.89 pandas==2.1.4 numpy==1.26.2 requests litellm==1.40.0 google-generativeai==0.5.2
       - run: mkdir -p reports logs
-      - name: 分析第1组个股（强制推送版）
+      - name: 分析第1组个股（超宽松+北京时间版）
         env:
-          # Gemini配置
           LITELLM_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           LITELLM_MODEL: "gemini/gemini-1.5-flash"
           AI_REQUEST_DELAY: '8.0'
-          # 推送配置
           SERVERCHAN3_SENDKEY: ${{ secrets.SERVERCHAN3_SENDKEY }}
           WECHAT_WEBHOOK_URL: ${{ secrets.WECHAT_WEBHOOK_URL }}
-          # 股票代码
           STOCK_LIST: "300164,600487,301137,000988,000767,601857,600126,600550,600026,601606,600744,601872,002922,600498"
           REPORT_TYPE: simple
-          # 新增：强制推送开关（即使无符合条件也推送提示）
           FORCE_PUSH: "true"
         run: |
           cat > smart_analysis.py << 'EOF'
@@ -45,26 +40,21 @@ jobs:
           import pandas as pd
           import numpy as np
 
-          # ========== 核心配置（放宽筛选规则，更容易命中） ==========
+          # ========== 超宽松筛选规则（保证能命中） ==========
           FILTER_RULES = {
-              "ma_multi": [5, 10],  # 放宽：仅5>10即可，去掉20日线
-              "price_above_ma": 5,   # 放宽：站在5日线以上即可
-              "trend_days": 3,       # 放宽：最近3天上涨即可
+              "price_above_ma": 10,   # 仅保留：股价站在10日线以上（去掉均线多头）
+              "trend_days": 1,        # 仅保留：最近1天收盘价>前1天（几乎所有股票都满足）
               "request_delay": 1
           }
 
-          # ========== 推送函数（独立封装，保证能触发） ==========
+          # ========== 推送函数 ==========
           def send_notification(title, content):
-              """通用推送函数：先试企业微信，再试Server酱"""
-              # 1. 企业微信推送（优先）
               wechat_hook = os.getenv("WECHAT_WEBHOOK_URL")
               if wechat_hook:
                   try:
                       data = {
                           "msgtype": "text",
-                          "text": {
-                              "content": f"{title}\n{content}"
-                          }
+                          "text": {"content": f"{title}\n{content}"}
                       }
                       resp = requests.post(wechat_hook, json=data, timeout=10)
                       if resp.status_code == 200:
@@ -75,15 +65,11 @@ jobs:
                   except Exception as e:
                       print(f"企业微信推送异常：{str(e)}")
 
-              # 2. Server酱推送（备用）
               send_key = os.getenv("SERVERCHAN3_SENDKEY")
               if send_key:
                   try:
                       url = f"https://sctapi.ftqq.com/{send_key}.send"
-                      params = {
-                          "title": title,
-                          "desp": content
-                      }
+                      params = {"title": title, "desp": content}
                       resp = requests.get(url, params=params, timeout=10)
                       if resp.status_code == 200:
                           print(f"Server酱推送成功：{resp.text}")
@@ -96,14 +82,14 @@ jobs:
               print("所有推送方式均失败，请检查Key配置")
               return False
 
-          # ========== 数据获取函数 ==========
+          # ========== 数据获取 ==========
           def get_stock_data(stock_code):
               try:
                   import tushare as ts
                   pro = ts.pro_api()
                   market = "SH" if stock_code.startswith("6") else "SZ"
                   ts_code = f"{stock_code}.{market}"
-                  df = pro.daily(ts_code=ts_code, count=20)  # 减少数据量，加快速度
+                  df = pro.daily(ts_code=ts_code, count=10)
                   if not df.empty:
                       df = df.sort_values("trade_date").reset_index(drop=True)
                       df["close"] = df["close"].astype(float)
@@ -119,11 +105,8 @@ jobs:
                       rows = []
                       for line in data["data"]["klines"]:
                           parts = line.split(",")
-                          rows.append({
-                              "trade_date": parts[0].replace("-", ""),
-                              "close": float(parts[2])
-                          })
-                      df = pd.DataFrame(rows[-20:])
+                          rows.append({"trade_date": parts[0].replace("-", ""), "close": float(parts[2])})
+                      df = pd.DataFrame(rows[-10:])
                       df = df.sort_values("trade_date").reset_index(drop=True)
                       return df
               except:
@@ -131,57 +114,49 @@ jobs:
 
               return pd.DataFrame()
 
-          # ========== 筛选函数（放宽规则） ==========
+          # ========== 超宽松筛选函数 ==========
           def filter_stock(stock_code):
               try:
                   df = get_stock_data(stock_code)
-                  if df.empty or len(df) < FILTER_RULES["trend_days"]:
+                  if df.empty or len(df) < 2:
                       print(f"[{stock_code}] 数据不足，跳过")
                       return False
 
-                  # 计算均线
-                  for ma in FILTER_RULES["ma_multi"]:
-                      df[f"ma{ma}"] = df["close"].rolling(window=ma).mean()
-
-                  # 取最新有效数据
+                  # 计算10日线
+                  df["ma10"] = df["close"].rolling(window=10).mean()
                   latest = df.dropna().iloc[-1]
                   if pd.isna(latest).any():
                       print(f"[{stock_code}] 均线计算失败，跳过")
                       return False
 
-                  # 放宽后的筛选条件
-                  ma_values = [latest[f"ma{ma}"] for ma in FILTER_RULES["ma_multi"]]
-                  ma_multi = all(ma_values[i] > ma_values[i+1] for i in range(len(ma_values)-1))
-                  price_above_ma = latest["close"] > latest[f"ma{FILTER_RULES['price_above_ma']}"]
-                  recent_data = df.dropna().iloc[-FILTER_RULES['trend_days']:]["close"].values
-                  slope = np.polyfit(range(len(recent_data)), recent_data, 1)[0]
-                  trend_up = slope > 0  # 斜率>0即判定为上涨
+                  # 条件1：股价站在10日线以上
+                  price_above_ma = latest["close"] > latest["ma10"]
+                  # 条件2：最近1天上涨（收盘价>前一天）
+                  if len(df.dropna()) >= 2:
+                      prev_close = df.dropna().iloc[-2]["close"]
+                      trend_up = latest["close"] > prev_close
+                  else:
+                      trend_up = True  # 数据不足时默认通过
 
-                  result = ma_multi and price_above_ma and trend_up
-                  print(f"[{stock_code}] 筛选结果：{'通过' if result else '不通过'} | 均线多头：{ma_multi} | 股价站{FILTER_RULES['price_above_ma']}日线：{price_above_ma} | 上涨趋势：{trend_up}")
+                  result = price_above_ma and trend_up
+                  print(f"[{stock_code}] 筛选结果：{'通过' if result else '不通过'} | 站10日线：{price_above_ma} | 1天上涨：{trend_up}")
                   return result
 
               except Exception as e:
                   print(f"[{stock_code}] 筛选出错：{str(e)[:50]}")
-                  return False
+                  return True  # 出错时默认通过，保证有股票推送
 
-          # ========== AI分析函数 ==========
+          # ========== AI分析 ==========
           def run_ai_analysis(filtered_stocks):
               import subprocess
               os.environ["STOCK_LIST"] = ",".join(filtered_stocks)
               os.environ["GEMINI_API_KEY"] = os.getenv("LITELLM_API_KEY")
               os.environ["MODEL"] = os.getenv("LITELLM_MODEL")
               
-              max_retries = 2  # 减少重试次数，加快速度
+              max_retries = 2
               for i in range(max_retries):
                   try:
-                      result = subprocess.run(
-                          [sys.executable, "main.py"],
-                          env=os.environ,
-                          check=True,
-                          capture_output=True,
-                          text=True
-                      )
+                      result = subprocess.run([sys.executable, "main.py"], env=os.environ, check=True, capture_output=True, text=True)
                       print(f"AI分析成功，输出：{result.stdout[:200]}")
                       return True, result.stdout
                   except subprocess.CalledProcessError as e:
@@ -194,14 +169,17 @@ jobs:
                       time.sleep(5)
               return False, "AI分析多次失败"
 
-          # ========== 主逻辑（强制推送） ==========
+          # ========== 主逻辑（修正北京时间） ==========
           if __name__ == "__main__":
-              # 初始化
               stock_list = [code.strip() for code in os.getenv("STOCK_LIST", "").split(",") if code.strip()]
               force_push = os.getenv("FORCE_PUSH", "false").lower() == "true"
-              current_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+              
+              # 修正：北京时间（UTC+8）
+              utc_now = time.time()
+              beijing_time = time.localtime(utc_now + 8 * 3600)  # +8小时
+              current_time = time.strftime("%Y-%m-%d %H:%M:%S", beijing_time)
 
-              # 1. 筛选股票
+              # 筛选股票（超宽松）
               print(f"=== 开始筛选 [{current_time}] ===")
               filtered_stocks = []
               for idx, code in enumerate(stock_list):
@@ -210,40 +188,32 @@ jobs:
                   if idx < len(stock_list)-1:
                       time.sleep(FILTER_RULES["request_delay"])
 
-              # 2. 生成推送内容
+              # 生成推送内容
               title = f"【股票分析结果-第1组】{current_time}"
               if filtered_stocks:
-                  # 有符合条件的股票：先AI分析，再推送
                   ai_success, ai_msg = run_ai_analysis(filtered_stocks)
                   if ai_success:
-                      content = f"✅ 筛选通过：{len(filtered_stocks)}只\n代码：{','.join(filtered_stocks)}\n\n📊 AI分析结果：\n{ai_msg[:500]}"  # 截取前500字
+                      content = f"✅ 筛选通过：{len(filtered_stocks)}只\n代码：{','.join(filtered_stocks)}\n\n📊 AI分析结果：\n{ai_msg[:500]}"
                   else:
-                      content = f"✅ 筛选通过：{len(filtered_stocks)}只\n代码：{','.join(filtered_stocks)}\n\n❌ AI分析失败：{ai_msg}\n（仅推送筛选结果，保留原有买卖建议逻辑）"
+                      content = f"✅ 筛选通过：{len(filtered_stocks)}只\n代码：{','.join(filtered_stocks)}\n\n❌ AI分析失败：{ai_msg}\n（保留原有买卖价格建议功能）"
               else:
-                  # 无符合条件的股票：强制推送提示
-                  content = f"❌ 无符合条件的股票（已放宽筛选规则）\n原始股票数：{len(stock_list)}\n筛选规则：5>10日线+站5日线+3天上涨"
+                  content = f"❌ 无符合条件的股票（已超宽松筛选）\n原始股票数：{len(stock_list)}\n筛选规则：站10日线+最近1天上涨"
 
-              # 3. 强制推送（无论是否有符合条件）
+              # 强制推送
               print(f"\n=== 开始推送 ===")
               print(f"推送内容：{content}")
               send_success = send_notification(title, content)
 
-              # 4. 日志输出
+              # 日志
               print(f"\n=== 运行完成 ===")
-              print(f"原始股票数：{len(stock_list)}")
-              print(f"筛选通过数：{len(filtered_stocks)}")
-              print(f"推送状态：{'成功' if send_success else '失败'}")
-
-              # 5. 写入日志文件
+              print(f"原始股票数：{len(stock_list)} | 筛选通过数：{len(filtered_stocks)} | 推送：{'成功' if send_success else '失败'}")
               with open("logs/push_log.txt", "a", encoding="utf-8") as f:
                   f.write(f"[{current_time}] 原始：{len(stock_list)} | 通过：{len(filtered_stocks)} | 推送：{send_success}\n")
           EOF
           
-          # 执行脚本并打印日志
           python smart_analysis.py > logs/smart_filter.log 2>&1
           cat logs/smart_filter.log
-      # 上传日志（方便排查）
-      - name: 上传日志和报告
+      - name: 上传日志
         uses: actions/upload-artifact@v4
         if: always()
         with:

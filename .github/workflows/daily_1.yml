@@ -10,7 +10,7 @@ on:
 jobs:
   run:
     runs-on: ubuntu-latest
-    # 超时保护：20分钟（足够运行35只）
+    # 超时保护：20分钟（足够运行14只）
     timeout-minutes: 20
     steps:
       # 检出仓库代码
@@ -23,24 +23,173 @@ jobs:
       # 安装依赖包
       - run: |
           pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install -r requirements.txt || echo "无requirements.txt，跳过"
+          # 安装技术分析+AI依赖
+          pip install tushare==1.2.89 pandas==2.1.4 numpy==1.26.2 requests litellm==1.40.0
       # 创建必要目录
       - run: mkdir -p reports logs
-      # 核心：运行股票分析
-      - name: 分析第1组个股
+      # 核心：智能筛选+Gemini AI分析
+      - name: 分析第1组个股（10组稳定版）
         env:
-          # AI配置（核心防限流）
-          AIHUBMIX_KEY: ${{ secrets.AIHUBMIX_KEY }}
-          AI_REQUEST_DELAY: '5.0' # 每只股票分析间隔5秒，杜绝限流
+          # 使用Gemini接口（已配置Secret）
+          LITELLM_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          LITELLM_MODEL: "gemini/gemini-1.5-flash"
+          AI_REQUEST_DELAY: '8.0'  # 延迟防限流
           # 推送配置
           SERVERCHAN3_SENDKEY: ${{ secrets.SERVERCHAN3_SENDKEY }}
           WECHAT_WEBHOOK_URL: ${{ secrets.WECHAT_WEBHOOK_URL }}
-          # 个股代码（无需修改）
-          STOCK_LIST: "300164,600487,301137,000988,000767,601857,600126,600550,600026,601606,600744,601872,002922,600498,000899,002261,002428,001896,600875,600230,600010,601212,600759,002498,301018,600722,002378,603466,002506,002155,000858,002009,600986,000681,002342"
-          # 报告配置（轻量模式，更快）
+          # 第1组股票代码
+          STOCK_LIST: "300164,600487,301137,000988,000767,601857,600126,600550,600026,601606,600744,601872,002922,600498"
           REPORT_TYPE: simple
-        run: python main.py
-      # 上传报告（方便查看）
+        run: |
+          cat > smart_analysis.py << 'EOF'
+          import os
+          import sys
+          import time
+          import json
+          import requests
+          import pandas as pd
+          import numpy as np
+
+          # 筛选规则配置
+          FILTER_RULES = {
+              "ma_multi": [5, 10, 20],
+              "price_above_ma": 10,
+              "trend_days": 5,
+              "request_delay": 1
+          }
+
+          # 双数据源获取股票数据
+          def get_stock_data(stock_code):
+              try:
+                  import tushare as ts
+                  pro = ts.pro_api()
+                  market = "SH" if stock_code.startswith("6") else "SZ"
+                  ts_code = f"{stock_code}.{market}"
+                  df = pro.daily(ts_code=ts_code, count=30)
+                  if not df.empty:
+                      df = df.sort_values("trade_date").reset_index(drop=True)
+                      df["close"] = df["close"].astype(float)
+                      return df
+              except:
+                  pass
+
+              try:
+                  url = f"https://push2his.eastmoney.com/api/qt/stock/kline/get?secid={1 if stock_code.startswith('6') else 0}.{stock_code}&klt=101&fqt=0&beg=0&end=20990101&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56,f57,f58"
+                  resp = requests.get(url, timeout=10)
+                  data = resp.json()
+                  if data["data"]["klines"]:
+                      rows = []
+                      for line in data["data"]["klines"]:
+                          parts = line.split(",")
+                          rows.append({
+                              "trade_date": parts[0].replace("-", ""),
+                              "close": float(parts[2])
+                          })
+                      df = pd.DataFrame(rows[-30:])
+                      df = df.sort_values("trade_date").reset_index(drop=True)
+                      return df
+              except:
+                  pass
+
+              return pd.DataFrame()
+
+          # 筛选上涨趋势股票
+          def filter_stock(stock_code):
+              try:
+                  df = get_stock_data(stock_code)
+                  if df.empty or len(df) < FILTER_RULES["trend_days"]:
+                      print(f"[{stock_code}] 数据不足，跳过")
+                      return False
+
+                  for ma in FILTER_RULES["ma_multi"]:
+                      df[f"ma{ma}"] = df["close"].rolling(window=ma).mean()
+
+                  latest = df.dropna().iloc[-1]
+                  if pd.isna(latest).any():
+                      print(f"[{stock_code}] 均线计算失败，跳过")
+                      return False
+
+                  ma_values = [latest[f"ma{ma}"] for ma in FILTER_RULES["ma_multi"]]
+                  ma_multi = all(ma_values[i] > ma_values[i+1] for i in range(len(ma_values)-1))
+                  price_above_ma = latest["close"] > latest[f"ma{FILTER_RULES['price_above_ma']}"]
+                  recent_data = df.dropna().iloc[-FILTER_RULES['trend_days']:]["close"].values
+                  slope = np.polyfit(range(len(recent_data)), recent_data, 1)[0]
+                  trend_up = slope > 0
+
+                  result = ma_multi and price_above_ma and trend_up
+                  print(f"[{stock_code}] 筛选结果：{'通过' if result else '不通过'}")
+                  return result
+
+              except Exception as e:
+                  print(f"[{stock_code}] 筛选出错：{str(e)[:50]}")
+                  return False
+
+          # AI分析重试函数
+          def run_ai_analysis(filtered_stocks):
+              import subprocess
+              os.environ["STOCK_LIST"] = ",".join(filtered_stocks)
+              os.environ["GEMINI_API_KEY"] = os.getenv("LITELLM_API_KEY")
+              os.environ["MODEL"] = os.getenv("LITELLM_MODEL")
+              
+              max_retries = 3
+              for i in range(max_retries):
+                  try:
+                      result = subprocess.run(
+                          [sys.executable, "main.py"],
+                          env=os.environ,
+                          check=True,
+                          capture_output=True,
+                          text=True
+                      )
+                      print(f"AI分析成功，输出：{result.stdout[:200]}")
+                      return True
+                  except subprocess.CalledProcessError as e:
+                      print(f"第{i+1}次AI分析失败，错误：{e.stderr[:200]}")
+                      time.sleep(8)
+                  except Exception as e:
+                      print(f"第{i+1}次运行异常：{str(e)[:50]}")
+                      time.sleep(8)
+              return False
+
+          # 主逻辑
+          if __name__ == "__main__":
+              stock_list = [code.strip() for code in os.getenv("STOCK_LIST", "").split(",") if code.strip()]
+              if not stock_list:
+                  print("无股票代码，退出")
+                  sys.exit(0)
+
+              filtered_stocks = []
+              for idx, code in enumerate(stock_list):
+                  if filter_stock(code):
+                      filtered_stocks.append(code)
+                  if idx < len(stock_list)-1:
+                      time.sleep(FILTER_RULES["request_delay"])
+
+              print(f"\n=== 筛选完成 ===")
+              print(f"原始股票数：{len(stock_list)}")
+              print(f"符合条件数：{len(filtered_stocks)}")
+              print(f"符合条件代码：{','.join(filtered_stocks) if filtered_stocks else '无'}")
+
+              if filtered_stocks:
+                  if not run_ai_analysis(filtered_stocks):
+                      # 降级推送
+                      wechat_hook = os.getenv("WECHAT_WEBHOOK_URL")
+                      if wechat_hook:
+                          data = {
+                              "msgtype": "text",
+                              "text": {"content": f"【上涨趋势股票-第1组】\n符合条件代码：{','.join(filtered_stocks)}\nAI分析暂时失败，仅推送筛选结果"}
+                          }
+                          requests.post(wechat_hook, json=data)
+                      print("AI分析多次失败，已推送筛选结果到企业微信")
+              else:
+                  print("无符合条件的股票，不推送")
+          EOF
+          
+          # 执行脚本并输出日志
+          python smart_analysis.py > logs/smart_filter.log 2>&1
+          cat logs/smart_filter.log
+      # 上传报告
       - name: 上传第1组分析报告
         uses: actions/upload-artifact@v4
         if: always()

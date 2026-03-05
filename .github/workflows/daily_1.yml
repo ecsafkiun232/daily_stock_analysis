@@ -1,44 +1,33 @@
 name: 股票分析-第1组
 
 on:
-  # 定时触发：北京时间18:00（UTC 10:00）
   schedule:
     - cron: '0 10 * * 1-5'
-  # 手动触发开关
   workflow_dispatch:
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    # 超时保护：20分钟（足够运行14只）
     timeout-minutes: 20
     steps:
-      # 检出仓库代码
       - uses: actions/checkout@v4
-      # 配置Python环境
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip' # 缓存依赖，加速安装
-      # 安装依赖包
+          cache: 'pip'
+      # 修复：新增google-generativeai依赖
       - run: |
           pip install --upgrade pip
           pip install -r requirements.txt || echo "无requirements.txt，跳过"
-          # 安装技术分析+AI依赖
-          pip install tushare==1.2.89 pandas==2.1.4 numpy==1.26.2 requests litellm==1.40.0
-      # 创建必要目录
+          pip install tushare==1.2.89 pandas==2.1.4 numpy==1.26.2 requests litellm==1.40.0 google-generativeai==0.5.2
       - run: mkdir -p reports logs
-      # 核心：智能筛选+Gemini AI分析
-      - name: 分析第1组个股（10组稳定版）
+      - name: 分析第1组个股（修复Gemini依赖）
         env:
-          # 使用Gemini接口（已配置Secret）
           LITELLM_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           LITELLM_MODEL: "gemini/gemini-1.5-flash"
-          AI_REQUEST_DELAY: '8.0'  # 延迟防限流
-          # 推送配置
+          AI_REQUEST_DELAY: '8.0'
           SERVERCHAN3_SENDKEY: ${{ secrets.SERVERCHAN3_SENDKEY }}
           WECHAT_WEBHOOK_URL: ${{ secrets.WECHAT_WEBHOOK_URL }}
-          # 第1组股票代码
           STOCK_LIST: "300164,600487,301137,000988,000767,601857,600126,600550,600026,601606,600744,601872,002922,600498"
           REPORT_TYPE: simple
         run: |
@@ -51,7 +40,6 @@ jobs:
           import pandas as pd
           import numpy as np
 
-          # 筛选规则配置
           FILTER_RULES = {
               "ma_multi": [5, 10, 20],
               "price_above_ma": 10,
@@ -59,7 +47,6 @@ jobs:
               "request_delay": 1
           }
 
-          # 双数据源获取股票数据
           def get_stock_data(stock_code):
               try:
                   import tushare as ts
@@ -94,7 +81,6 @@ jobs:
 
               return pd.DataFrame()
 
-          # 筛选上涨趋势股票
           def filter_stock(stock_code):
               try:
                   df = get_stock_data(stock_code)
@@ -125,7 +111,6 @@ jobs:
                   print(f"[{stock_code}] 筛选出错：{str(e)[:50]}")
                   return False
 
-          # AI分析重试函数
           def run_ai_analysis(filtered_stocks):
               import subprocess
               os.environ["STOCK_LIST"] = ",".join(filtered_stocks)
@@ -152,7 +137,6 @@ jobs:
                       time.sleep(8)
               return False
 
-          # 主逻辑
           if __name__ == "__main__":
               stock_list = [code.strip() for code in os.getenv("STOCK_LIST", "").split(",") if code.strip()]
               if not stock_list:
@@ -173,7 +157,6 @@ jobs:
 
               if filtered_stocks:
                   if not run_ai_analysis(filtered_stocks):
-                      # 降级推送
                       wechat_hook = os.getenv("WECHAT_WEBHOOK_URL")
                       if wechat_hook:
                           data = {
@@ -186,10 +169,8 @@ jobs:
                   print("无符合条件的股票，不推送")
           EOF
           
-          # 执行脚本并输出日志
           python smart_analysis.py > logs/smart_filter.log 2>&1
           cat logs/smart_filter.log
-      # 上传报告
       - name: 上传第1组分析报告
         uses: actions/upload-artifact@v4
         if: always()
